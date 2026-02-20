@@ -1,0 +1,49 @@
+# Environment and secrets
+.env
+*.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# UV
+.python-version
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs (keep structure, ignore content)
+vault/Logs/*.json
+
+# Obsidian internal config (user-specific)
+vault/.obsidian/
+
+# Pytest cache
+.pytest_cache/
+
+# Session data
+sessions/
+*.session
+
+# Orchestrator log file
+vault/Logs/orchestrator.log
