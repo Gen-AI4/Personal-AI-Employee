@@ -18,11 +18,10 @@ import json
 import signal
 import logging
 import shutil
-import subprocess
 import threading
 import time
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 
 # Add src to path for imports
@@ -32,14 +31,25 @@ from watchers.filesystem_watcher import FileSystemWatcher
 
 load_dotenv()
 
-# Configuration from environment
+# Configuration from environment with validation
 VAULT_PATH = os.getenv("VAULT_PATH", "./vault")
 WATCH_FOLDER = os.getenv("WATCH_FOLDER", None)
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "10"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 DEV_MODE = os.getenv("DEV_MODE", "true").lower() == "true"
 
+try:
+    CHECK_INTERVAL = max(1, int(os.getenv("CHECK_INTERVAL", "10")))
+except ValueError:
+    CHECK_INTERVAL = 10
+
+# Validate LOG_LEVEL
+if not hasattr(logging, LOG_LEVEL):
+    LOG_LEVEL = "INFO"
+
 logger = logging.getLogger("Orchestrator")
+
+# Thread lock for log file writes (shared with watchers via base_watcher._log_file_lock)
+_log_file_lock = threading.Lock()
 
 
 def setup_logging(vault_path: str) -> None:
@@ -74,6 +84,7 @@ class Orchestrator:
         self.approved = self.vault_path / "Approved"
         self.logs_dir = self.vault_path / "Logs"
         self._running = False
+        self._stopped = False
         self._watcher = None
         self._watcher_thread = None
 
@@ -91,46 +102,59 @@ class Orchestrator:
             (self.vault_path / d).mkdir(parents=True, exist_ok=True)
 
     def log_action(self, action_type: str, details: dict) -> None:
-        """Write a structured log entry."""
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        """Write a structured log entry. Thread-safe via lock."""
+        now = datetime.now(timezone.utc)
+        today = now.strftime("%Y-%m-%d")
         log_file = self.logs_dir / f"{today}.json"
 
         entry = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": now.isoformat(),
             "action_type": action_type,
             "actor": "orchestrator",
             **details,
         }
 
-        entries = []
-        if log_file.exists():
-            try:
-                entries = json.loads(log_file.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                entries = []
+        with _log_file_lock:
+            entries = []
+            if log_file.exists():
+                try:
+                    entries = json.loads(log_file.read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, OSError):
+                    logger.warning(
+                        f"Corrupted log file {log_file.name}, starting fresh"
+                    )
+                    entries = []
 
-        entries.append(entry)
-        log_file.write_text(
-            json.dumps(entries, indent=2, ensure_ascii=False), encoding="utf-8"
-        )
+            entries.append(entry)
+            log_file.write_text(
+                json.dumps(entries, indent=2, ensure_ascii=False), encoding="utf-8"
+            )
 
     def get_pending_items(self) -> list[Path]:
         """Return list of .md files in /Needs_Action awaiting processing."""
-        if not self.needs_action.exists():
+        try:
+            if not self.needs_action.exists():
+                return []
+            return sorted(
+                f for f in self.needs_action.iterdir()
+                if f.is_file() and f.suffix == ".md" and f.name != ".gitkeep"
+            )
+        except OSError as e:
+            logger.warning(f"Error reading Needs_Action: {e}")
             return []
-        return sorted(
-            f for f in self.needs_action.iterdir()
-            if f.is_file() and f.suffix == ".md" and f.name != ".gitkeep"
-        )
 
     def get_approved_items(self) -> list[Path]:
         """Return list of approved action files."""
-        if not self.approved.exists():
+        try:
+            if not self.approved.exists():
+                return []
+            return sorted(
+                f for f in self.approved.iterdir()
+                if f.is_file() and f.suffix == ".md" and f.name != ".gitkeep"
+            )
+        except OSError as e:
+            logger.warning(f"Error reading Approved: {e}")
             return []
-        return sorted(
-            f for f in self.approved.iterdir()
-            if f.is_file() and f.suffix == ".md" and f.name != ".gitkeep"
-        )
 
     def move_to_done(self, filepath: Path) -> Path:
         """Move a processed file to /Done with a timestamp prefix."""
@@ -150,11 +174,15 @@ class Orchestrator:
         dashboard_path = self.vault_path / "Dashboard.md"
         now = datetime.now(timezone.utc)
 
-        # Count items in each folder
-        inbox_count = sum(
-            1 for f in (self.vault_path / "Inbox").iterdir()
-            if f.is_file() and not f.name.startswith(".")
-        ) if (self.vault_path / "Inbox").exists() else 0
+        # Count items in each folder (with error handling for race conditions)
+        try:
+            inbox_path = self.vault_path / "Inbox"
+            inbox_count = sum(
+                1 for f in inbox_path.iterdir()
+                if f.is_file() and not f.name.startswith(".")
+            ) if inbox_path.exists() else 0
+        except OSError:
+            inbox_count = 0
 
         needs_action_count = len(self.get_pending_items())
 
@@ -173,7 +201,6 @@ class Orchestrator:
 
         # Count done items from this week's logs
         for i in range(7):
-            from datetime import timedelta
             day = now - timedelta(days=i)
             day_log = self.logs_dir / f"{day.strftime('%Y-%m-%d')}.json"
             if day_log.exists():
@@ -272,17 +299,25 @@ auto_refresh: true
         """Run a single processing cycle. Returns a summary dict.
 
         This is useful for testing and for manual triggering.
+        Catches exceptions to prevent a single bad file from crashing the loop.
         """
-        summary = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "pending_items": len(self.get_pending_items()),
-            "approved_processed": self.process_approved_items(),
-        }
+        try:
+            summary = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "pending_items": len(self.get_pending_items()),
+                "approved_processed": self.process_approved_items(),
+            }
 
-        self.update_dashboard()
-
-        self.log_action("cycle_complete", summary)
-        return summary
+            self.update_dashboard()
+            self.log_action("cycle_complete", summary)
+            return summary
+        except Exception as e:
+            logger.error(f"Error during processing cycle: {e}")
+            self.log_action("cycle_error", {"error": str(e)})
+            return {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "error": str(e),
+            }
 
     def run(self) -> None:
         """Main orchestrator loop.
@@ -300,6 +335,7 @@ auto_refresh: true
         logger.info("=" * 60)
 
         self._running = True
+        self._stopped = False
         self._start_watcher()
         self.update_dashboard()
 
@@ -318,7 +354,14 @@ auto_refresh: true
             self.stop()
 
     def stop(self) -> None:
-        """Gracefully shut down the orchestrator and all watchers."""
+        """Gracefully shut down the orchestrator and all watchers.
+
+        Idempotent: safe to call multiple times.
+        """
+        if self._stopped:
+            return
+        self._stopped = True
+
         logger.info("Shutting down orchestrator...")
         self._running = False
 
@@ -335,7 +378,7 @@ def main():
     setup_logging(VAULT_PATH)
     orchestrator = Orchestrator(vault_path=VAULT_PATH)
 
-    # Handle graceful shutdown
+    # Handle graceful shutdown via signal
     def signal_handler(sig, frame):
         orchestrator.stop()
         sys.exit(0)

@@ -5,12 +5,16 @@ All watchers follow the Perception layer pattern: continuously monitor a source
 for new items and create actionable .md files in the vault's /Needs_Action folder.
 """
 
-import time
 import logging
 import json
+import threading
 from pathlib import Path
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
+
+
+# Module-level lock for log file writes to prevent concurrent corruption
+_log_file_lock = threading.Lock()
 
 
 class BaseWatcher(ABC):
@@ -28,6 +32,7 @@ class BaseWatcher(ABC):
         self.check_interval = check_interval
         self.logger = logging.getLogger(self.__class__.__name__)
         self._running = False
+        self._stop_event = threading.Event()
 
         # Ensure required directories exist
         self.needs_action.mkdir(parents=True, exist_ok=True)
@@ -44,35 +49,43 @@ class BaseWatcher(ABC):
         pass
 
     def log_action(self, action_type: str, details: dict) -> None:
-        """Append a structured log entry to today's log file."""
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        """Append a structured log entry to today's log file.
+
+        Thread-safe: uses a lock to prevent concurrent read-modify-write corruption.
+        """
+        now = datetime.now(timezone.utc)
+        today = now.strftime("%Y-%m-%d")
         log_file = self.logs_dir / f"{today}.json"
 
         entry = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": now.isoformat(),
             "watcher": self.__class__.__name__,
             "action_type": action_type,
             "actor": "watcher",
             **details,
         }
 
-        # Read existing log entries or start fresh
-        entries = []
-        if log_file.exists():
-            try:
-                entries = json.loads(log_file.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                entries = []
+        with _log_file_lock:
+            entries = []
+            if log_file.exists():
+                try:
+                    entries = json.loads(log_file.read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, OSError):
+                    self.logger.warning(
+                        f"Corrupted log file {log_file.name}, starting fresh"
+                    )
+                    entries = []
 
-        entries.append(entry)
-        log_file.write_text(
-            json.dumps(entries, indent=2, ensure_ascii=False), encoding="utf-8"
-        )
+            entries.append(entry)
+            log_file.write_text(
+                json.dumps(entries, indent=2, ensure_ascii=False), encoding="utf-8"
+            )
 
     def run(self) -> None:
         """Main loop: poll for updates and create action files."""
         self.logger.info(f"Starting {self.__class__.__name__}")
         self._running = True
+        self._stop_event.clear()
 
         while self._running:
             try:
@@ -90,9 +103,12 @@ class BaseWatcher(ABC):
                     "error",
                     {"error": str(e), "result": "failure"},
                 )
-            time.sleep(self.check_interval)
+            # Use Event.wait() instead of time.sleep() for immediate shutdown
+            if self._stop_event.wait(timeout=self.check_interval):
+                break
 
     def stop(self) -> None:
         """Signal the watcher to stop its run loop."""
         self._running = False
+        self._stop_event.set()
         self.logger.info(f"Stopping {self.__class__.__name__}")

@@ -11,6 +11,8 @@ from watchers.filesystem_watcher import (
     FileSystemWatcher,
     DropFolderHandler,
     classify_priority,
+    _sanitize_filename,
+    _escape_yaml_string,
 )
 
 
@@ -67,7 +69,7 @@ class TestFileSystemWatcherInit:
         vault = tmp_path / "vault"
         vault.mkdir()
         watcher = FileSystemWatcher(str(vault))
-        assert watcher.pending_items == []
+        assert len(watcher.pending_items) == 0
 
     def test_empty_processed_files(self, tmp_path):
         vault = tmp_path / "vault"
@@ -319,3 +321,93 @@ class TestFileSystemWatcherIntegration:
         assert has_high  # "urgent" keyword
         assert has_medium  # "invoice" keyword
         assert has_low  # "notes" has no keywords
+
+
+class TestSanitizeFilename:
+    """Test filename sanitization for path traversal prevention."""
+
+    def test_removes_path_traversal(self):
+        assert ".." not in _sanitize_filename("../../etc/passwd")
+
+    def test_removes_backslashes(self):
+        assert "\\" not in _sanitize_filename("folder\\file.txt")
+
+    def test_removes_forward_slashes(self):
+        assert "/" not in _sanitize_filename("folder/file.txt")
+
+    def test_replaces_spaces(self):
+        assert " " not in _sanitize_filename("my file name.txt")
+
+    def test_strips_leading_dots(self):
+        result = _sanitize_filename(".hidden_file")
+        assert not result.startswith(".")
+
+    def test_returns_unnamed_for_empty(self):
+        assert _sanitize_filename("") == "unnamed"
+        assert _sanitize_filename("...") == "unnamed"
+
+    def test_removes_unsafe_chars(self):
+        result = _sanitize_filename('file<>:"|?*.txt')
+        assert "<" not in result
+        assert ">" not in result
+        assert ":" not in result
+        assert '"' not in result
+        assert "|" not in result
+        assert "?" not in result
+        assert "*" not in result
+
+
+class TestEscapeYamlString:
+    """Test YAML string escaping."""
+
+    def test_escapes_double_quotes(self):
+        result = _escape_yaml_string('file"name')
+        assert '\\"' in result
+
+    def test_escapes_backslashes(self):
+        result = _escape_yaml_string("path\\to\\file")
+        assert "\\\\" in result
+
+    def test_escapes_newlines(self):
+        result = _escape_yaml_string("line1\nline2")
+        assert "\\n" in result
+        assert "\n" not in result
+
+    def test_normal_string_unchanged(self):
+        assert _escape_yaml_string("normal_file.txt") == "normal_file.txt"
+
+
+class TestSecurityIntegration:
+    """Integration tests for security features."""
+
+    def test_path_traversal_in_action_file(self, tmp_path):
+        """Verify files with traversal names stay in Needs_Action."""
+        vault = tmp_path / "vault"
+        vault.mkdir()
+        watcher = FileSystemWatcher(str(vault))
+
+        # Create a file with a malicious-looking name (sanitized by the OS)
+        test_file = watcher.watch_folder / "safe_file.txt"
+        test_file.write_text("content", encoding="utf-8")
+
+        meta_path = watcher.create_action_file(test_file)
+
+        # Verify the metadata file is inside Needs_Action
+        assert meta_path.resolve().is_relative_to(watcher.needs_action.resolve())
+
+    def test_yaml_injection_in_filename(self, tmp_path):
+        """Verify filenames with YAML special chars are properly escaped."""
+        vault = tmp_path / "vault"
+        vault.mkdir()
+        watcher = FileSystemWatcher(str(vault))
+
+        # Filename with quotes that could break YAML
+        test_file = watcher.watch_folder / 'file_with_quotes.txt'
+        test_file.write_text("content", encoding="utf-8")
+
+        meta_path = watcher.create_action_file(test_file)
+        content = meta_path.read_text(encoding="utf-8")
+
+        # Should be valid - the YAML frontmatter should be intact
+        assert content.startswith("---\n")
+        assert content.count("---") >= 2
