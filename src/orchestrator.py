@@ -1,15 +1,16 @@
 """
-Orchestrator - Master process that coordinates watchers and Claude Code.
+Orchestrator - Master process that coordinates watchers, planner,
+approval workflow, and scheduler.
 
 The orchestrator is the "automation glue" that:
-1. Starts and manages watcher processes
-2. Monitors /Needs_Action for new items
-3. Triggers Claude Code to process pending items
-4. Watches /Approved folder for human-approved actions
+1. Starts and manages multiple watcher processes (Silver: filesystem + gmail + linkedin)
+2. Monitors /Needs_Action for new items and creates plans
+3. Manages the human-in-the-loop approval workflow
+4. Runs scheduled tasks (dashboard refresh, briefings)
 5. Updates the Dashboard after processing cycles
 
-For Bronze tier, this runs the FileSystem Watcher and provides
-the interface for Claude Code to read from and write to the vault.
+Bronze tier: FileSystem Watcher + vault read/write
+Silver tier: Multiple watchers, planner, approval, scheduler integration
 """
 
 import os
@@ -28,6 +29,12 @@ from dotenv import load_dotenv
 sys.path.insert(0, str(Path(__file__).parent))
 
 from watchers.filesystem_watcher import FileSystemWatcher
+from watchers.gmail_watcher import GmailWatcher
+from watchers.linkedin_watcher import LinkedInWatcher
+from approval import ApprovalManager
+from planner import Planner
+from scheduler import Scheduler, ScheduledTask
+from log_utils import log_file_lock as _log_file_lock
 
 load_dotenv()
 
@@ -36,6 +43,10 @@ VAULT_PATH = os.getenv("VAULT_PATH", "./vault")
 WATCH_FOLDER = os.getenv("WATCH_FOLDER", None)
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 DEV_MODE = os.getenv("DEV_MODE", "true").lower() == "true"
+
+# Feature flags for optional watchers
+ENABLE_GMAIL = os.getenv("ENABLE_GMAIL", "false").lower() == "true"
+ENABLE_LINKEDIN = os.getenv("ENABLE_LINKEDIN", "false").lower() == "true"
 
 try:
     CHECK_INTERVAL = max(1, int(os.getenv("CHECK_INTERVAL", "10")))
@@ -47,9 +58,6 @@ if not hasattr(logging, LOG_LEVEL):
     LOG_LEVEL = "INFO"
 
 logger = logging.getLogger("Orchestrator")
-
-# Thread lock for log file writes (shared with watchers via base_watcher._log_file_lock)
-_log_file_lock = threading.Lock()
 
 
 def setup_logging(vault_path: str) -> None:
@@ -71,10 +79,13 @@ def setup_logging(vault_path: str) -> None:
 
 
 class Orchestrator:
-    """Master process coordinating watchers and vault workflow.
+    """Master process coordinating watchers, planner, approvals, and scheduler.
 
-    The orchestrator manages the lifecycle of watcher processes and
-    provides the trigger mechanism for Claude Code to process items.
+    Silver tier extends Bronze with:
+    - Multiple watchers (filesystem, gmail, linkedin)
+    - Planner that creates Plan.md files for pending items
+    - Approval manager for HITL workflow
+    - Scheduler for periodic tasks
     """
 
     def __init__(self, vault_path: str = VAULT_PATH):
@@ -85,8 +96,14 @@ class Orchestrator:
         self.logs_dir = self.vault_path / "Logs"
         self._running = False
         self._stopped = False
-        self._watcher = None
-        self._watcher_thread = None
+
+        # Watcher management
+        self._watchers: dict[str, dict] = {}  # name -> {"watcher": ..., "thread": ...}
+
+        # Silver tier components
+        self._approval_manager = None
+        self._planner = None
+        self._scheduler = None
 
         # Ensure all vault directories exist
         self._ensure_vault_structure()
@@ -170,11 +187,11 @@ class Orchestrator:
         return dest
 
     def update_dashboard(self) -> None:
-        """Update Dashboard.md with current vault state."""
+        """Update Dashboard.md with current vault state including Silver tier metrics."""
         dashboard_path = self.vault_path / "Dashboard.md"
         now = datetime.now(timezone.utc)
 
-        # Count items in each folder (with error handling for race conditions)
+        # Count items in each folder
         try:
             inbox_path = self.vault_path / "Inbox"
             inbox_count = sum(
@@ -185,6 +202,30 @@ class Orchestrator:
             inbox_count = 0
 
         needs_action_count = len(self.get_pending_items())
+
+        # Count pending approvals
+        pending_approval_count = 0
+        try:
+            pa_dir = self.vault_path / "Pending_Approval"
+            if pa_dir.exists():
+                pending_approval_count = sum(
+                    1 for f in pa_dir.iterdir()
+                    if f.is_file() and f.suffix == ".md" and f.name != ".gitkeep"
+                )
+        except OSError:
+            pass
+
+        # Count plans
+        plans_count = 0
+        try:
+            plans_dir = self.vault_path / "Plans"
+            if plans_dir.exists():
+                plans_count = sum(
+                    1 for f in plans_dir.iterdir()
+                    if f.is_file() and f.suffix == ".md" and f.name != ".gitkeep"
+                )
+        except OSError:
+            pass
 
         done_today = 0
         done_week = 0
@@ -199,7 +240,6 @@ class Orchestrator:
             except (json.JSONDecodeError, OSError):
                 pass
 
-        # Count done items from this week's logs
         for i in range(7):
             day = now - timedelta(days=i)
             day_log = self.logs_dir / f"{day.strftime('%Y-%m-%d')}.json"
@@ -235,19 +275,44 @@ class Orchestrator:
         else:
             pending_text = "_No pending actions._"
 
+        # Active watchers list
+        watcher_lines = []
+        for name, info in self._watchers.items():
+            thread = info.get("thread")
+            status = "Active" if (thread and thread.is_alive()) else "Inactive"
+            watcher_lines.append(f"- **{name}**: {status}")
+        if not watcher_lines:
+            watcher_lines.append("- _No watchers configured_")
+        watchers_text = "\n".join(watcher_lines)
+
+        # Scheduler status
+        scheduler_text = "_Scheduler not running_"
+        if self._scheduler:
+            sched_status = self._scheduler.get_status()
+            if sched_status["tasks"]:
+                task_lines = []
+                for tname, tinfo in sched_status["tasks"].items():
+                    last = tinfo["last_run"][:19] if tinfo["last_run"] else "Never"
+                    task_lines.append(f"- **{tname}**: runs={tinfo['run_count']}, last={last}")
+                scheduler_text = "\n".join(task_lines)
+
         # Write dashboard
         dashboard_content = f"""---
 last_updated: {now.isoformat()}
 auto_refresh: true
+tier: silver
 ---
 
 # AI Employee Dashboard
 
 ## Status
 - **System Status**: {"Active" if self._running else "Stopped"}
-- **Watcher**: File System Watcher - {"Active" if self._watcher else "Inactive"}
 - **Dev Mode**: {"Enabled" if DEV_MODE else "Disabled"}
+- **Tier**: Silver
 - **Last Check**: {now.strftime('%Y-%m-%d %H:%M:%S UTC')}
+
+## Active Watchers
+{watchers_text}
 
 ## Pending Actions
 {pending_text}
@@ -255,30 +320,121 @@ auto_refresh: true
 ## Recent Activity
 {activity_text}
 
+## Scheduled Tasks
+{scheduler_text}
+
 ## Quick Stats
 | Metric | Value |
 |--------|-------|
 | Items in Inbox | {inbox_count} |
 | Items Needs Action | {needs_action_count} |
+| Pending Approvals | {pending_approval_count} |
+| Active Plans | {plans_count} |
 | Items Done (Today) | {done_today} |
 | Items Done (This Week) | {done_week} |
 """
         dashboard_path.write_text(dashboard_content, encoding="utf-8")
         logger.debug("Dashboard updated")
 
-    def _start_watcher(self) -> None:
-        """Start the filesystem watcher in a background thread."""
+    def _start_watcher(self, name: str, watcher) -> None:
+        """Start a watcher in a background thread."""
+        thread = threading.Thread(
+            target=watcher.run, daemon=True, name=name
+        )
+        self._watchers[name] = {"watcher": watcher, "thread": thread}
+        thread.start()
+        logger.info(f"Watcher started: {name}")
+
+    def _start_all_watchers(self) -> None:
+        """Start all configured watchers."""
+        # Always start the filesystem watcher (Bronze tier)
         watch_folder = WATCH_FOLDER if WATCH_FOLDER else None
-        self._watcher = FileSystemWatcher(
+        fs_watcher = FileSystemWatcher(
             vault_path=str(self.vault_path),
             watch_folder=watch_folder,
             check_interval=CHECK_INTERVAL,
         )
-        self._watcher_thread = threading.Thread(
-            target=self._watcher.run, daemon=True, name="FileSystemWatcher"
-        )
-        self._watcher_thread.start()
-        logger.info("FileSystem Watcher started")
+        self._start_watcher("FileSystemWatcher", fs_watcher)
+
+        # Optional Gmail watcher (Silver tier)
+        if ENABLE_GMAIL:
+            try:
+                gmail_watcher = GmailWatcher(
+                    vault_path=str(self.vault_path),
+                    check_interval=120,
+                )
+                self._start_watcher("GmailWatcher", gmail_watcher)
+            except Exception as e:
+                logger.warning(f"Gmail watcher failed to start: {e}")
+
+        # Optional LinkedIn watcher (Silver tier)
+        if ENABLE_LINKEDIN:
+            try:
+                linkedin_watcher = LinkedInWatcher(
+                    vault_path=str(self.vault_path),
+                    check_interval=300,
+                )
+                self._start_watcher("LinkedInWatcher", linkedin_watcher)
+            except Exception as e:
+                logger.warning(f"LinkedIn watcher failed to start: {e}")
+
+    def _init_silver_components(self) -> None:
+        """Initialize Silver tier components: planner, approval manager, scheduler."""
+        vault_str = str(self.vault_path)
+
+        # Approval manager
+        self._approval_manager = ApprovalManager(vault_str)
+        logger.info("Approval manager initialized")
+
+        # Planner
+        self._planner = Planner(vault_str)
+        logger.info("Planner initialized")
+
+        # Scheduler with default tasks
+        self._scheduler = Scheduler(vault_str)
+        self._scheduler.add_task(ScheduledTask(
+            name="create_plans",
+            callback=self._planner.create_plans_for_pending,
+            interval_seconds=CHECK_INTERVAL * 3,
+            description="Create plans for new items in /Needs_Action",
+        ))
+        self._scheduler.add_task(ScheduledTask(
+            name="process_approvals",
+            callback=self._approval_manager.process_decisions,
+            interval_seconds=CHECK_INTERVAL * 2,
+            description="Process approved and rejected items",
+        ))
+        self._scheduler.add_task(ScheduledTask(
+            name="check_expired_approvals",
+            callback=self._approval_manager.check_expired_requests,
+            interval_seconds=3600,
+            description="Check for expired approval requests",
+        ))
+        logger.info(f"Scheduler initialized with {len(self._scheduler.get_tasks())} tasks")
+
+    # --- Keep Bronze-compatible methods ---
+
+    @property
+    def _watcher(self):
+        """Backwards-compatible property for Bronze tests."""
+        fs = self._watchers.get("FileSystemWatcher")
+        return fs["watcher"] if fs else None
+
+    @_watcher.setter
+    def _watcher(self, value):
+        """Backwards-compatible setter - no-op for Silver tier."""
+        pass
+
+    @property
+    def _watcher_thread(self):
+        """Backwards-compatible property for Bronze tests."""
+        fs = self._watchers.get("FileSystemWatcher")
+        return fs["thread"] if fs else None
+
+    @_watcher_thread.setter
+    def _watcher_thread(self, value):
+        """Backwards-compatible setter - no-op for Silver tier."""
+        pass
 
     def process_approved_items(self) -> int:
         """Process items that have been human-approved.
@@ -298,14 +454,22 @@ auto_refresh: true
     def run_cycle(self) -> dict:
         """Run a single processing cycle. Returns a summary dict.
 
-        This is useful for testing and for manual triggering.
-        Catches exceptions to prevent a single bad file from crashing the loop.
+        Silver tier extends Bronze cycle with:
+        - Scheduler check_and_run
+        - Plan creation for new items
+        - Approval workflow processing
         """
         try:
+            # Run scheduled tasks
+            scheduled_ran = []
+            if self._scheduler:
+                scheduled_ran = self._scheduler.check_and_run()
+
             summary = {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "pending_items": len(self.get_pending_items()),
                 "approved_processed": self.process_approved_items(),
+                "scheduled_tasks_ran": scheduled_ran,
             }
 
             self.update_dashboard()
@@ -322,26 +486,34 @@ auto_refresh: true
     def run(self) -> None:
         """Main orchestrator loop.
 
-        Starts the watcher, then periodically:
-        1. Checks for approved items and processes them
-        2. Updates the dashboard
-        3. Logs cycle summary
+        Starts all watchers and Silver tier components, then periodically
+        runs processing cycles.
         """
         logger.info("=" * 60)
-        logger.info("Personal AI Employee - Orchestrator Starting")
+        logger.info("Personal AI Employee - Orchestrator Starting (Silver Tier)")
         logger.info(f"  Vault: {self.vault_path.resolve()}")
         logger.info(f"  Dev Mode: {DEV_MODE}")
         logger.info(f"  Check Interval: {CHECK_INTERVAL}s")
+        logger.info(f"  Gmail Watcher: {'Enabled' if ENABLE_GMAIL else 'Disabled'}")
+        logger.info(f"  LinkedIn Watcher: {'Enabled' if ENABLE_LINKEDIN else 'Disabled'}")
         logger.info("=" * 60)
 
         self._running = True
         self._stopped = False
-        self._start_watcher()
+
+        # Start all watchers
+        self._start_all_watchers()
+
+        # Initialize Silver tier components
+        self._init_silver_components()
+
         self.update_dashboard()
 
         self.log_action("orchestrator_started", {
             "vault_path": str(self.vault_path.resolve()),
             "dev_mode": DEV_MODE,
+            "tier": "silver",
+            "watchers": list(self._watchers.keys()),
         })
 
         try:
@@ -354,7 +526,7 @@ auto_refresh: true
             self.stop()
 
     def stop(self) -> None:
-        """Gracefully shut down the orchestrator and all watchers.
+        """Gracefully shut down the orchestrator and all components.
 
         Idempotent: safe to call multiple times.
         """
@@ -365,8 +537,16 @@ auto_refresh: true
         logger.info("Shutting down orchestrator...")
         self._running = False
 
-        if self._watcher:
-            self._watcher.stop()
+        # Stop all watchers
+        for name, info in self._watchers.items():
+            watcher = info.get("watcher")
+            if watcher:
+                watcher.stop()
+                logger.info(f"Watcher stopped: {name}")
+
+        # Stop scheduler
+        if self._scheduler:
+            self._scheduler.stop()
 
         self.update_dashboard()
         self.log_action("orchestrator_stopped", {})

@@ -12,9 +12,9 @@ from pathlib import Path
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 
-
-# Module-level lock for log file writes to prevent concurrent corruption
-_log_file_lock = threading.Lock()
+import sys
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from log_utils import log_file_lock as _log_file_lock
 
 
 class BaseWatcher(ABC):
