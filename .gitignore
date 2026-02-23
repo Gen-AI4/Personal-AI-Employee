@@ -4,6 +4,10 @@
 .env.*
 !.env.example
 
+# OAuth credentials and tokens (contain secrets)
+credentials.json
+token.json
+
 # Python
 __pycache__/
 *.py[cod]
@@ -34,6 +38,17 @@ Thumbs.db
 
 # Logs (keep structure, ignore content)
 vault/Logs/*.json
+
+# Vault runtime data (may contain personal/sensitive content)
+vault/Inbox/*.md
+vault/Needs_Action/*.md
+vault/Done/*.md
+vault/Plans/PLAN_*.md
+vault/Pending_Approval/*.md
+vault/Approved/*.md
+vault/Rejected/*.md
+vault/Briefings/*.md
+vault/Accounting/*.md
 
 # Obsidian internal config (user-specific)
 vault/.obsidian/
