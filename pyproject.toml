@@ -1,12 +1,13 @@
 [project]
 name = "personal-ai-employee"
-version = "0.2.0"
-description = "Personal AI Employee - Silver Tier: Multi-watcher automation with planning, approvals, and scheduling"
+version = "0.3.0"
+description = "Personal AI Employee - Gold Tier: Full cross-domain integration with social media, Odoo accounting, CEO briefings, and autonomous task loops"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "watchdog>=4.0.0",
     "python-dotenv>=1.0.0",
+    "playwright>=1.58.0",
 ]
 
 [project.optional-dependencies]

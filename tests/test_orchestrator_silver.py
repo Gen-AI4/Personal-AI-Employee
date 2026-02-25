@@ -137,7 +137,8 @@ class TestSilverDashboard:
     def test_dashboard_shows_tier(self, orch, vault):
         orch.update_dashboard()
         content = (vault / "Dashboard.md").read_text(encoding="utf-8")
-        assert "tier: silver" in content
+        # Gold tier supersedes Silver — dashboard shows current highest tier
+        assert ("tier: silver" in content or "tier: gold" in content)
 
     def test_dashboard_shows_watchers_section(self, orch, vault):
         orch.update_dashboard()
@@ -266,6 +267,9 @@ class TestStartAllWatchers:
 
     @patch("orchestrator.ENABLE_GMAIL", False)
     @patch("orchestrator.ENABLE_LINKEDIN", False)
+    @patch("orchestrator.ENABLE_FACEBOOK", False)
+    @patch("orchestrator.ENABLE_INSTAGRAM", False)
+    @patch("orchestrator.ENABLE_TWITTER", False)
     def test_starts_filesystem_watcher_only(self, orch):
         orch._start_all_watchers()
         assert "FileSystemWatcher" in orch._watchers

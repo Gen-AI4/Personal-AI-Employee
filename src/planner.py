@@ -72,6 +72,153 @@ PLAN_TEMPLATES = {
             "Log action",
         ],
     },
+    # --- Gold tier: Social media templates ---
+    "facebook_message": {
+        "title": "Facebook Message Response Plan",
+        "default_steps": [
+            "Read Facebook message content",
+            "Check if sender is known contact",
+            "Draft appropriate response",
+            "Submit for approval",
+            "Send response via Facebook",
+            "Log action",
+        ],
+    },
+    "facebook_friend_request": {
+        "title": "Facebook Friend Request Plan",
+        "default_steps": [
+            "Review sender profile",
+            "Check against business goals for relevance",
+            "Accept or decline request",
+            "Send welcome message if accepted",
+            "Log decision",
+        ],
+    },
+    "facebook_engagement": {
+        "title": "Facebook Engagement Plan",
+        "default_steps": [
+            "Review engagement (like/comment/share)",
+            "Determine if response needed",
+            "Draft response if applicable",
+            "Submit for approval if external communication",
+            "Execute engagement action",
+            "Log action",
+        ],
+    },
+    "facebook_business": {
+        "title": "Facebook Business Notification Plan",
+        "default_steps": [
+            "Review business page notification",
+            "Analyze insights or promotion data",
+            "Determine required action",
+            "Update Business_Goals.md if metrics changed",
+            "Log action",
+        ],
+    },
+    "instagram_message": {
+        "title": "Instagram DM Response Plan",
+        "default_steps": [
+            "Read Instagram direct message",
+            "Check if sender is known contact",
+            "Draft appropriate response",
+            "Submit for approval",
+            "Send response via Instagram",
+            "Log action",
+        ],
+    },
+    "instagram_follow_request": {
+        "title": "Instagram Follow Request Plan",
+        "default_steps": [
+            "Review follower profile",
+            "Check relevance to business audience",
+            "Accept or decline follow request",
+            "Log decision",
+        ],
+    },
+    "instagram_engagement": {
+        "title": "Instagram Engagement Plan",
+        "default_steps": [
+            "Review engagement (like/comment)",
+            "Determine if response needed",
+            "Draft response comment if applicable",
+            "Submit for approval if external",
+            "Execute engagement action",
+            "Log action",
+        ],
+    },
+    "instagram_business": {
+        "title": "Instagram Business Notification Plan",
+        "default_steps": [
+            "Review business account notification",
+            "Analyze insights or promotion data",
+            "Determine required action",
+            "Update Business_Goals.md if metrics changed",
+            "Log action",
+        ],
+    },
+    "twitter_message": {
+        "title": "Twitter DM Response Plan",
+        "default_steps": [
+            "Read Twitter direct message",
+            "Check if sender is known contact",
+            "Draft appropriate response",
+            "Submit for approval",
+            "Send response via Twitter",
+            "Log action",
+        ],
+    },
+    "twitter_mention": {
+        "title": "Twitter Mention Response Plan",
+        "default_steps": [
+            "Review tweet mention or reply",
+            "Assess sentiment and context",
+            "Draft response if appropriate",
+            "Submit for approval",
+            "Reply via Twitter",
+            "Log action",
+        ],
+    },
+    "twitter_engagement": {
+        "title": "Twitter Engagement Plan",
+        "default_steps": [
+            "Review engagement (like/retweet/quote)",
+            "Determine if response or acknowledgement needed",
+            "Execute engagement action if needed",
+            "Log action",
+        ],
+    },
+    "twitter_business": {
+        "title": "Twitter Business Analytics Plan",
+        "default_steps": [
+            "Review Twitter analytics or promotion notification",
+            "Analyze performance metrics",
+            "Determine required action",
+            "Update Business_Goals.md if metrics changed",
+            "Log action",
+        ],
+    },
+    "odoo_invoice": {
+        "title": "Invoice Processing Plan",
+        "default_steps": [
+            "Review invoice details in Odoo",
+            "Verify invoice amount and recipient",
+            "Submit for approval (required for all payments)",
+            "Process payment after approval",
+            "Update accounting summary",
+            "Log action",
+        ],
+    },
+    "odoo_payment": {
+        "title": "Payment Processing Plan",
+        "default_steps": [
+            "Review payment details",
+            "Verify payee and amount",
+            "Submit for approval (always required)",
+            "Execute payment after approval",
+            "Update Odoo records",
+            "Log action",
+        ],
+    },
     "default": {
         "title": "Action Plan",
         "default_steps": [
@@ -153,12 +300,16 @@ class Planner:
         """Get the plan template for a given action type."""
         # Normalize type names
         normalized = action_type.lower().replace("-", "_").replace(" ", "_")
-        if normalized.startswith("linkedin_"):
-            # Map linkedin subtypes
-            subtype = normalized.replace("linkedin_", "")
-            template_key = f"linkedin_{subtype}"
-            if template_key in PLAN_TEMPLATES:
-                return PLAN_TEMPLATES[template_key]
+
+        # Map platform-prefixed action types to templates
+        platform_prefixes = (
+            "linkedin_", "facebook_", "instagram_", "twitter_", "odoo_",
+        )
+        for prefix in platform_prefixes:
+            if normalized.startswith(prefix):
+                if normalized in PLAN_TEMPLATES:
+                    return PLAN_TEMPLATES[normalized]
+
         return PLAN_TEMPLATES.get(normalized, PLAN_TEMPLATES["default"])
 
     def _determine_approval_needed(self, action_type: str, priority: str) -> bool:

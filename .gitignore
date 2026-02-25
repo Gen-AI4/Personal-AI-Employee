@@ -62,3 +62,18 @@ sessions/
 
 # Orchestrator log file
 vault/Logs/orchestrator.log
+
+# Login session seeders (no secrets, but generate local session data)
+facebook_login.py
+instagram_login.py
+twitter_login.py
+
+# Browser automation screenshots and debug output
+*.png
+mcp_out.txt
+raw_out.bin
+snapshot_out.txt
+
+# Vault runtime assets
+vault/*.png
+vault/Dashboard.md

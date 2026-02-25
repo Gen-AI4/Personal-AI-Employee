@@ -29,6 +29,14 @@ ALWAYS_REQUIRE_APPROVAL = {
     "file_delete",
     "external_api_call",
     "new_contact_email",
+    # Gold tier: social media posting
+    "facebook_post",
+    "instagram_post",
+    "twitter_post",
+    # Gold tier: accounting operations
+    "odoo_payment",
+    "odoo_invoice_post",
+    "accounting_action",
 }
 
 # Actions that can be auto-approved
@@ -37,6 +45,10 @@ AUTO_APPROVE = {
     "log_create",
     "dashboard_update",
     "plan_create",
+    # Gold tier: read-only operations
+    "briefing_generate",
+    "accounting_summary",
+    "social_summary",
 }
 
 

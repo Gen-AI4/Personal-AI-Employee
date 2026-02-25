@@ -3,14 +3,17 @@ Orchestrator - Master process that coordinates watchers, planner,
 approval workflow, and scheduler.
 
 The orchestrator is the "automation glue" that:
-1. Starts and manages multiple watcher processes (Silver: filesystem + gmail + linkedin)
+1. Starts and manages multiple watcher processes
 2. Monitors /Needs_Action for new items and creates plans
 3. Manages the human-in-the-loop approval workflow
-4. Runs scheduled tasks (dashboard refresh, briefings)
+4. Runs scheduled tasks (dashboard refresh, briefings, accounting)
 5. Updates the Dashboard after processing cycles
 
 Bronze tier: FileSystem Watcher + vault read/write
 Silver tier: Multiple watchers, planner, approval, scheduler integration
+Gold tier:  Social media watchers (Facebook, Instagram, Twitter),
+            Odoo accounting integration, CEO Briefing generator,
+            Ralph Wiggum loop, error recovery with retry logic
 """
 
 import os
@@ -31,9 +34,15 @@ sys.path.insert(0, str(Path(__file__).parent))
 from watchers.filesystem_watcher import FileSystemWatcher
 from watchers.gmail_watcher import GmailWatcher
 from watchers.linkedin_watcher import LinkedInWatcher
+from watchers.facebook_watcher import FacebookWatcher
+from watchers.instagram_watcher import InstagramWatcher
+from watchers.twitter_watcher import TwitterWatcher
 from approval import ApprovalManager
 from planner import Planner
 from scheduler import Scheduler, ScheduledTask
+from odoo_connector import OdooConnector
+from briefing import BriefingGenerator
+from retry_handler import ErrorTracker
 from log_utils import log_file_lock as _log_file_lock
 
 load_dotenv()
@@ -44,9 +53,18 @@ WATCH_FOLDER = os.getenv("WATCH_FOLDER", None)
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 DEV_MODE = os.getenv("DEV_MODE", "true").lower() == "true"
 
-# Feature flags for optional watchers
+# Feature flags for optional watchers (Silver)
 ENABLE_GMAIL = os.getenv("ENABLE_GMAIL", "false").lower() == "true"
 ENABLE_LINKEDIN = os.getenv("ENABLE_LINKEDIN", "false").lower() == "true"
+
+# Feature flags for Gold tier watchers
+ENABLE_FACEBOOK = os.getenv("ENABLE_FACEBOOK", "false").lower() == "true"
+ENABLE_INSTAGRAM = os.getenv("ENABLE_INSTAGRAM", "false").lower() == "true"
+ENABLE_TWITTER = os.getenv("ENABLE_TWITTER", "false").lower() == "true"
+
+# Feature flags for Gold tier integrations
+ENABLE_ODOO = os.getenv("ENABLE_ODOO", "false").lower() == "true"
+ENABLE_CEO_BRIEFING = os.getenv("ENABLE_CEO_BRIEFING", "true").lower() == "true"
 
 try:
     CHECK_INTERVAL = max(1, int(os.getenv("CHECK_INTERVAL", "10")))
@@ -86,6 +104,13 @@ class Orchestrator:
     - Planner that creates Plan.md files for pending items
     - Approval manager for HITL workflow
     - Scheduler for periodic tasks
+
+    Gold tier extends Silver with:
+    - Social media watchers (Facebook, Instagram, Twitter)
+    - Odoo accounting integration
+    - CEO Briefing generator (weekly business audit)
+    - Error recovery with ErrorTracker per component
+    - Ralph Wiggum loop support
     """
 
     def __init__(self, vault_path: str = VAULT_PATH):
@@ -104,6 +129,11 @@ class Orchestrator:
         self._approval_manager = None
         self._planner = None
         self._scheduler = None
+
+        # Gold tier components
+        self._odoo = None
+        self._briefing_generator = None
+        self._error_tracker = ErrorTracker(threshold=5, window_seconds=300)
 
         # Ensure all vault directories exist
         self._ensure_vault_structure()
@@ -296,11 +326,39 @@ class Orchestrator:
                     task_lines.append(f"- **{tname}**: runs={tinfo['run_count']}, last={last}")
                 scheduler_text = "\n".join(task_lines)
 
+        # Count briefings
+        briefings_count = 0
+        try:
+            briefings_dir = self.vault_path / "Briefings"
+            if briefings_dir.exists():
+                briefings_count = sum(
+                    1 for f in briefings_dir.iterdir()
+                    if f.is_file() and f.suffix == ".md" and f.name != ".gitkeep"
+                )
+        except OSError:
+            pass
+
+        # Count accounting summaries
+        accounting_count = 0
+        try:
+            accounting_dir = self.vault_path / "Accounting"
+            if accounting_dir.exists():
+                accounting_count = sum(
+                    1 for f in accounting_dir.iterdir()
+                    if f.is_file() and f.suffix == ".md" and f.name != ".gitkeep"
+                )
+        except OSError:
+            pass
+
+        # Error tracker status
+        error_status = self._error_tracker.get_status()
+        circuit_breaker = "OPEN (degraded)" if error_status["circuit_breaker"] else "Closed"
+
         # Write dashboard
         dashboard_content = f"""---
 last_updated: {now.isoformat()}
 auto_refresh: true
-tier: silver
+tier: gold
 ---
 
 # AI Employee Dashboard
@@ -308,7 +366,7 @@ tier: silver
 ## Status
 - **System Status**: {"Active" if self._running else "Stopped"}
 - **Dev Mode**: {"Enabled" if DEV_MODE else "Disabled"}
-- **Tier**: Silver
+- **Tier**: Gold
 - **Last Check**: {now.strftime('%Y-%m-%d %H:%M:%S UTC')}
 
 ## Active Watchers
@@ -330,8 +388,17 @@ tier: silver
 | Items Needs Action | {needs_action_count} |
 | Pending Approvals | {pending_approval_count} |
 | Active Plans | {plans_count} |
+| CEO Briefings | {briefings_count} |
+| Accounting Summaries | {accounting_count} |
 | Items Done (Today) | {done_today} |
 | Items Done (This Week) | {done_week} |
+
+## Error Recovery
+| Metric | Value |
+|--------|-------|
+| Recent Errors | {error_status['recent_errors']} |
+| Total Errors | {error_status['total_errors']} |
+| Circuit Breaker | {circuit_breaker} |
 """
         dashboard_path.write_text(dashboard_content, encoding="utf-8")
         logger.debug("Dashboard updated")
@@ -378,6 +445,39 @@ tier: silver
             except Exception as e:
                 logger.warning(f"LinkedIn watcher failed to start: {e}")
 
+        # Optional Facebook watcher (Gold tier)
+        if ENABLE_FACEBOOK:
+            try:
+                facebook_watcher = FacebookWatcher(
+                    vault_path=str(self.vault_path),
+                    check_interval=300,
+                )
+                self._start_watcher("FacebookWatcher", facebook_watcher)
+            except Exception as e:
+                logger.warning(f"Facebook watcher failed to start: {e}")
+
+        # Optional Instagram watcher (Gold tier)
+        if ENABLE_INSTAGRAM:
+            try:
+                instagram_watcher = InstagramWatcher(
+                    vault_path=str(self.vault_path),
+                    check_interval=300,
+                )
+                self._start_watcher("InstagramWatcher", instagram_watcher)
+            except Exception as e:
+                logger.warning(f"Instagram watcher failed to start: {e}")
+
+        # Optional Twitter watcher (Gold tier)
+        if ENABLE_TWITTER:
+            try:
+                twitter_watcher = TwitterWatcher(
+                    vault_path=str(self.vault_path),
+                    check_interval=300,
+                )
+                self._start_watcher("TwitterWatcher", twitter_watcher)
+            except Exception as e:
+                logger.warning(f"Twitter watcher failed to start: {e}")
+
     def _init_silver_components(self) -> None:
         """Initialize Silver tier components: planner, approval manager, scheduler."""
         vault_str = str(self.vault_path)
@@ -411,6 +511,53 @@ tier: silver
             description="Check for expired approval requests",
         ))
         logger.info(f"Scheduler initialized with {len(self._scheduler.get_tasks())} tasks")
+
+    def _init_gold_components(self) -> None:
+        """Initialize Gold tier components: Odoo, briefing generator, Gold tasks."""
+        vault_str = str(self.vault_path)
+
+        # Odoo accounting integration (optional)
+        if ENABLE_ODOO:
+            try:
+                self._odoo = OdooConnector(vault_str)
+                if not DEV_MODE:
+                    self._odoo.authenticate()
+                logger.info("Odoo connector initialized")
+            except Exception as e:
+                logger.warning(f"Odoo connector failed to initialize: {e}")
+
+        # CEO Briefing generator (always initialized, Odoo is optional)
+        if ENABLE_CEO_BRIEFING:
+            self._briefing_generator = BriefingGenerator(
+                vault_path=vault_str,
+                odoo_connector=self._odoo,
+            )
+            logger.info("Briefing generator initialized")
+
+            # Schedule weekly CEO briefing (Sunday 20:00 UTC)
+            if self._scheduler:
+                self._scheduler.add_task(ScheduledTask(
+                    name="generate_ceo_briefing",
+                    callback=self._briefing_generator.generate_briefing,
+                    run_at_hour=20,
+                    run_at_minute=0,
+                    description="Generate weekly Monday Morning CEO Briefing",
+                ))
+
+                # Schedule monthly accounting summary (if Odoo enabled)
+                if self._odoo:
+                    self._scheduler.add_task(ScheduledTask(
+                        name="accounting_summary",
+                        callback=self._odoo.write_accounting_summary,
+                        run_at_hour=6,
+                        run_at_minute=0,
+                        description="Generate monthly accounting summary from Odoo",
+                    ))
+
+                logger.info(
+                    f"Scheduler updated with Gold tasks: "
+                    f"{len(self._scheduler.get_tasks())} total tasks"
+                )
 
     # --- Keep Bronze-compatible methods ---
 
@@ -454,13 +601,14 @@ tier: silver
     def run_cycle(self) -> dict:
         """Run a single processing cycle. Returns a summary dict.
 
-        Silver tier extends Bronze cycle with:
-        - Scheduler check_and_run
+        Gold tier extends Silver cycle with:
+        - Error tracking and circuit breaker awareness
+        - Scheduler check_and_run (includes Gold tier scheduled tasks)
         - Plan creation for new items
         - Approval workflow processing
         """
         try:
-            # Run scheduled tasks
+            # Run scheduled tasks (includes Gold tier tasks if configured)
             scheduled_ran = []
             if self._scheduler:
                 scheduled_ran = self._scheduler.check_and_run()
@@ -470,12 +618,14 @@ tier: silver
                 "pending_items": len(self.get_pending_items()),
                 "approved_processed": self.process_approved_items(),
                 "scheduled_tasks_ran": scheduled_ran,
+                "error_tracker": self._error_tracker.get_status(),
             }
 
             self.update_dashboard()
             self.log_action("cycle_complete", summary)
             return summary
         except Exception as e:
+            self._error_tracker.record_error("system")
             logger.error(f"Error during processing cycle: {e}")
             self.log_action("cycle_error", {"error": str(e)})
             return {
@@ -486,34 +636,44 @@ tier: silver
     def run(self) -> None:
         """Main orchestrator loop.
 
-        Starts all watchers and Silver tier components, then periodically
+        Starts all watchers and all tier components, then periodically
         runs processing cycles.
         """
         logger.info("=" * 60)
-        logger.info("Personal AI Employee - Orchestrator Starting (Silver Tier)")
+        logger.info("Personal AI Employee - Orchestrator Starting (Gold Tier)")
         logger.info(f"  Vault: {self.vault_path.resolve()}")
         logger.info(f"  Dev Mode: {DEV_MODE}")
         logger.info(f"  Check Interval: {CHECK_INTERVAL}s")
         logger.info(f"  Gmail Watcher: {'Enabled' if ENABLE_GMAIL else 'Disabled'}")
         logger.info(f"  LinkedIn Watcher: {'Enabled' if ENABLE_LINKEDIN else 'Disabled'}")
+        logger.info(f"  Facebook Watcher: {'Enabled' if ENABLE_FACEBOOK else 'Disabled'}")
+        logger.info(f"  Instagram Watcher: {'Enabled' if ENABLE_INSTAGRAM else 'Disabled'}")
+        logger.info(f"  Twitter Watcher: {'Enabled' if ENABLE_TWITTER else 'Disabled'}")
+        logger.info(f"  Odoo Integration: {'Enabled' if ENABLE_ODOO else 'Disabled'}")
+        logger.info(f"  CEO Briefing: {'Enabled' if ENABLE_CEO_BRIEFING else 'Disabled'}")
         logger.info("=" * 60)
 
         self._running = True
         self._stopped = False
 
-        # Start all watchers
+        # Start all watchers (Bronze + Silver + Gold)
         self._start_all_watchers()
 
         # Initialize Silver tier components
         self._init_silver_components()
+
+        # Initialize Gold tier components
+        self._init_gold_components()
 
         self.update_dashboard()
 
         self.log_action("orchestrator_started", {
             "vault_path": str(self.vault_path.resolve()),
             "dev_mode": DEV_MODE,
-            "tier": "silver",
+            "tier": "gold",
             "watchers": list(self._watchers.keys()),
+            "odoo_enabled": ENABLE_ODOO,
+            "briefing_enabled": ENABLE_CEO_BRIEFING,
         })
 
         try:
